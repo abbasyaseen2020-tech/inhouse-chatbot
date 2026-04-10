@@ -77,7 +77,7 @@ MAX_HISTORY = 20
 # ============================================
 _processed_messages = {}
 _processed_comments = {}
-DEDUP_TTL = 60
+DEDUP_TTL = 300
 
 
 def is_duplicate_message(msg_id):
@@ -506,8 +506,19 @@ def handle_webhook():
         for entry in data.get("entry", []):
             for event in entry.get("messaging", []):
                 sender_id = event["sender"]["id"]
+
+                # Skip messages from the page itself
+                if sender_id == PAGE_ID:
+                    continue
+
                 if "message" in event:
                     message = event["message"]
+
+                    # Skip echo messages (bot's own replies)
+                    if message.get("is_echo"):
+                        logger.debug(f"Skipping echo message from {sender_id}")
+                        continue
+
                     msg_id = message.get("mid")
                     text = message.get("quick_reply", {}).get("payload") or message.get("text", "")
                     if text:
