@@ -369,7 +369,73 @@ def handle_message(user_id, message_text, platform="messenger", message_id=None)
         return
     logger.info(f"[{platform}] {user_id}: {text[:100]}")
     ai_response = ask_ai(user_id, text, platform)
-    send_messenger_message(user_id, ai_response)
+
+    # Attach quick replies at key conversation stages
+    msg_count = len(conversation_history.get(user_id, []))
+    data = user_data.get(user_id, {})
+
+    quick_replies = None
+    if msg_count <= 2:
+        quick_replies = [
+            {"content_type": "text", "title": "🏠 شقق متاحة", "payload": "ICE_APARTMENT"},
+            {"content_type": "text", "title": "💰 أسعار", "payload": "ICE_PRICES"},
+            {"content_type": "text", "title": "📞 كلّم مسؤول", "payload": "ICE_CONTACT"},
+        ]
+    elif msg_count >= 6 and not data.get("phone"):
+        quick_replies = [
+            {"content_type": "text", "title": "📝 سجّل طلبك", "payload": "REGISTER_LEAD"},
+            {"content_type": "text", "title": "📞 واتساب", "payload": "ICE_CONTACT"},
+        ]
+
+    if quick_replies and len(ai_response) <= 2000:
+        _send_messenger_raw(user_id, ai_response, quick_replies=quick_replies)
+    else:
+        send_messenger_message(user_id, ai_response)
+
+
+# ============================================
+# POSTBACK & WELCOME HANDLERS
+# ============================================
+def handle_postback(user_id, payload):
+    """Handle postback buttons (Get Started, Ice Breakers, Persistent Menu)."""
+    logger.info(f"[postback] {user_id}: {payload}")
+
+    if payload == "GET_STARTED":
+        send_welcome_message(user_id)
+    elif payload in ("ICE_APARTMENT", "MENU_APARTMENTS"):
+        handle_message(user_id, "عايز شقة في بني سويف", "messenger")
+    elif payload in ("ICE_PRICES", "MENU_PRICES"):
+        handle_message(user_id, "عايز أعرف الأسعار", "messenger")
+    elif payload in ("ICE_CONTACT", "MENU_CONTACT"):
+        send_contact_info(user_id)
+    else:
+        handle_message(user_id, payload, "messenger")
+
+
+def send_welcome_message(user_id):
+    """Welcome message with quick reply buttons when user taps Get Started."""
+    text = (
+        "أهلاً بيك في إن هاوس! 🏠\n"
+        "إحنا وسيط عقاري في بني سويف — بنساعدك تلاقي شقتك المناسبة.\n\n"
+        "إيه اللي تحب تعرفه؟ 👇"
+    )
+    quick_replies = [
+        {"content_type": "text", "title": "🏠 عايز شقة", "payload": "ICE_APARTMENT"},
+        {"content_type": "text", "title": "💰 الأسعار", "payload": "ICE_PRICES"},
+        {"content_type": "text", "title": "📞 كلّم مسؤول", "payload": "ICE_CONTACT"},
+    ]
+    _send_messenger_raw(user_id, text, quick_replies=quick_replies)
+
+
+def send_contact_info(user_id):
+    """Send contact details."""
+    text = (
+        "📞 تواصل مع فريق إن هاوس:\n\n"
+        "💬 واتساب: +20 107 073 6979\n"
+        "🌐 الموقع: https://in-house-bnc.netlify.app\n"
+        "📱 فيسبوك: facebook.com/in.housebnc"
+    )
+    _send_messenger_raw(user_id, text)
 
 
 # ============================================
@@ -433,14 +499,21 @@ def send_messenger_message(recipient_id, text):
         _send_messenger_raw(recipient_id, text)
 
 
-def _send_messenger_raw(recipient_id, text):
+def _send_messenger_raw(recipient_id, text, quick_replies=None):
     url = f"{GRAPH_API_URL}/me/messages"
-    payload = {"recipient": {"id": recipient_id}, "message": {"text": text}, "messaging_type": "RESPONSE"}
+    message = {"text": text}
+    if quick_replies:
+        message["quick_replies"] = quick_replies
+    payload = {"recipient": {"id": recipient_id}, "message": message, "messaging_type": "RESPONSE"}
     try:
         r = requests.post(url, json=payload, params={"access_token": PAGE_ACCESS_TOKEN}, timeout=10)
+        if not r.ok:
+            logger.error(f"Messenger send failed [{r.status_code}]: {r.text[:300]}")
         r.raise_for_status()
+    except requests.exceptions.HTTPError:
+        pass  # already logged above
     except Exception as e:
-        logger.error(f"Messenger send failed: {e}")
+        logger.error(f"Messenger send exception: {e}")
 
 
 def reply_to_comment(comment_id, text):
@@ -520,11 +593,19 @@ def handle_webhook():
                         continue
 
                     msg_id = message.get("mid")
-                    text = message.get("quick_reply", {}).get("payload") or message.get("text", "")
-                    if text:
+                    qr_payload = message.get("quick_reply", {}).get("payload", "")
+                    text = message.get("text", "")
+
+                    # Handle special quick reply payloads
+                    if qr_payload in ("ICE_CONTACT", "MENU_CONTACT"):
+                        send_contact_info(sender_id)
+                    elif qr_payload == "REGISTER_LEAD":
+                        _send_messenger_raw(sender_id,
+                            "📝 سجّل طلبك من هنا وهنتواصل معاك:\n👉 https://in-house-bnc.netlify.app\n\nأو ابعتلنا رقمك هنا وهنكلمك 😊")
+                    elif text:
                         handle_message(sender_id, text, "messenger", msg_id)
                 elif "postback" in event:
-                    handle_message(sender_id, event["postback"]["payload"], "messenger")
+                    handle_postback(sender_id, event["postback"]["payload"])
             for change in entry.get("changes", []):
                 if change.get("field") == "feed" and change["value"].get("item") == "comment":
                     handle_comment(change["value"])
@@ -636,13 +717,83 @@ def exchange_token():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/setup-messenger", methods=["POST", "GET"])
+def setup_messenger():
+    """Configure Get Started, Ice Breakers, Persistent Menu, Greeting."""
+    if not PAGE_ACCESS_TOKEN:
+        return jsonify({"error": "No PAGE_ACCESS_TOKEN configured"}), 400
+
+    results = {}
+    profile_url = f"{GRAPH_API_URL}/me/messenger_profile"
+    params = {"access_token": PAGE_ACCESS_TOKEN}
+
+    # 1. Greeting text
+    try:
+        r = requests.post(profile_url, params=params, json={
+            "greeting": [{
+                "locale": "default",
+                "text": "أهلاً بيك في إن هاوس للتسويق العقاري! 🏠\nابدأ دلوقتي عشان نساعدك تلاقي شقتك."
+            }]
+        }, timeout=10)
+        results["greeting"] = r.json()
+    except Exception as e:
+        results["greeting"] = {"error": str(e)}
+
+    # 2. Get Started button
+    try:
+        r = requests.post(profile_url, params=params, json={
+            "get_started": {"payload": "GET_STARTED"}
+        }, timeout=10)
+        results["get_started"] = r.json()
+    except Exception as e:
+        results["get_started"] = {"error": str(e)}
+
+    # 3. Ice Breakers
+    try:
+        r = requests.post(profile_url, params=params, json={
+            "ice_breakers": [
+                {"question": "عايز شقة في بني سويف 🏠", "payload": "ICE_APARTMENT"},
+                {"question": "عايز أعرف الأسعار 💰", "payload": "ICE_PRICES"},
+                {"question": "كلّم مسؤول المبيعات 📞", "payload": "ICE_CONTACT"},
+            ]
+        }, timeout=10)
+        results["ice_breakers"] = r.json()
+    except Exception as e:
+        results["ice_breakers"] = {"error": str(e)}
+
+    # 4. Persistent Menu
+    try:
+        r = requests.post(profile_url, params=params, json={
+            "persistent_menu": [{
+                "locale": "default",
+                "composer_input_disabled": False,
+                "call_to_actions": [
+                    {"type": "postback", "title": "🏠 الشقق المتاحة", "payload": "MENU_APARTMENTS"},
+                    {"type": "postback", "title": "💰 الأسعار", "payload": "MENU_PRICES"},
+                    {"type": "postback", "title": "📞 تواصل معانا", "payload": "MENU_CONTACT"},
+                    {"type": "web_url", "title": "🌐 الموقع", "url": "https://in-house-bnc.netlify.app"},
+                ]
+            }]
+        }, timeout=10)
+        results["persistent_menu"] = r.json()
+    except Exception as e:
+        results["persistent_menu"] = {"error": str(e)}
+
+    # Also subscribe to required webhook fields
+    sub_result = subscribe_page_feed()
+    results["subscription"] = sub_result
+
+    logger.info(f"Messenger profile setup: {results}")
+    return jsonify(results)
+
+
 def subscribe_page_feed():
     if not PAGE_ACCESS_TOKEN:
         return {"success": False, "error": "No token"}
     try:
         r = requests.post(f"{GRAPH_API_URL}/me/subscribed_apps",
                           params={"access_token": PAGE_ACCESS_TOKEN},
-                          data={"subscribed_fields": "feed,messages"}, timeout=10)
+                          data={"subscribed_fields": "feed,messages,messaging_postbacks"}, timeout=10)
         result = r.json()
         logger.info(f"Subscribe result: {result}")
         return result
