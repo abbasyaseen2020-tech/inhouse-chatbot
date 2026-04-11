@@ -194,26 +194,28 @@ def ask_ai(user_id, user_message, platform="messenger"):
             ctx += "]"
             system_prompt += f"\n\n## العميل الحالي:{ctx}"
 
-    is_first = len(conversation_history[user_id]) <= 1
     msg_count = len(conversation_history[user_id])
-
-    if is_first:
-        system_prompt += "\n\n## أول رسالة — رحب بالعميل كفريق إن هاوس."
-    else:
-        system_prompt += "\n\n## محادثة مكملة — رد مباشر ومختصر."
-
     has_phone = bool(user_data.get(user_id, {}).get("phone"))
     asked_phone = phone_requested.get(user_id, False)
+    sent_link = any("in-house-bnc.netlify.app" in m.get("content", "") for m in conversation_history.get(user_id, []) if m.get("role") == "assistant")
+
+    # Conversation stage context
+    if msg_count <= 1:
+        system_prompt += "\n\n## أنت في مرحلة 1 (ترحيب): رحب جملة واحدة بسيطة واسأل العميل بيدور على إيه. ممنوع لينكات أو أرقام."
+    elif msg_count <= 4:
+        system_prompt += "\n\n## أنت في مرحلة 2 (اكتشاف): اسأل سؤال واحد بس عشان تفهم احتياج العميل (منطقة؟ مساحة؟ ميزانية؟). ممنوع لينكات أو عروض — ركّز على الأسئلة."
+    elif not sent_link:
+        system_prompt += "\n\n## أنت في مرحلة 3 (توجيه): لخّص اللي فهمته من العميل وابعت اللينك مرة واحدة: https://in-house-bnc.netlify.app"
+    else:
+        system_prompt += "\n\n## مرحلة 4 (متابعة): جاوب أسئلة العميل طبيعي. اللينك اتبعت قبل كده — ما تكررهوش."
 
     if has_phone:
         system_prompt += "\n## العميل ساب رقمه — ما تطلبش تاني."
     elif asked_phone:
-        system_prompt += "\n## طلبت الرقم قبل كده — ممنوع تطلبه تاني. وجّهه للينك."
-    elif msg_count < 4:
-        system_prompt += f"\n## رسالة {msg_count} — بدري على طلب الرقم. وجّهه للينك بدل."
+        system_prompt += "\n## طلبت الرقم قبل كده — ما تكررش."
 
     try:
-        ai_response = _call_ai(system_prompt, clean_history, max_tokens=150)
+        ai_response = _call_ai(system_prompt, clean_history, max_tokens=300)
         if not ai_response:
             fb = fallback_response(user_message)
             conversation_history[user_id].append({"role": "assistant", "content": fb})
@@ -381,16 +383,17 @@ def handle_message(user_id, message_text, platform="messenger", message_id=None)
     data = user_data.get(user_id, {})
 
     quick_replies = None
-    if msg_count <= 2:
+    if msg_count == 2:
+        # After first exchange, offer quick options
         quick_replies = [
-            {"content_type": "text", "title": "🏠 شقق متاحة", "payload": "ICE_APARTMENT"},
-            {"content_type": "text", "title": "💰 أسعار", "payload": "ICE_PRICES"},
-            {"content_type": "text", "title": "📞 كلّم مسؤول", "payload": "ICE_CONTACT"},
+            {"content_type": "text", "title": "🏠 شراء", "payload": "INTENT_BUY"},
+            {"content_type": "text", "title": "💰 بيع", "payload": "INTENT_SELL"},
+            {"content_type": "text", "title": "🔑 إيجار", "payload": "INTENT_RENT"},
         ]
-    elif msg_count >= 6 and not data.get("phone"):
+    elif msg_count >= 8 and not data.get("phone"):
         quick_replies = [
             {"content_type": "text", "title": "📝 سجّل طلبك", "payload": "REGISTER_LEAD"},
-            {"content_type": "text", "title": "📞 واتساب", "payload": "ICE_CONTACT"},
+            {"content_type": "text", "title": "📞 كلّم مسؤول", "payload": "ICE_CONTACT"},
         ]
 
     if quick_replies and len(ai_response) <= 2000:
@@ -408,12 +411,16 @@ def handle_postback(user_id, payload):
 
     if payload == "GET_STARTED":
         send_welcome_message(user_id)
-    elif payload in ("ICE_APARTMENT", "MENU_APARTMENTS"):
-        handle_message(user_id, "عايز شقة في بني سويف", "messenger")
+    elif payload in ("ICE_APARTMENT", "MENU_APARTMENTS", "INTENT_BUY"):
+        handle_message(user_id, "عايز أشتري شقة في بني سويف", "messenger")
     elif payload in ("ICE_PRICES", "MENU_PRICES"):
         handle_message(user_id, "عايز أعرف الأسعار", "messenger")
     elif payload in ("ICE_CONTACT", "MENU_CONTACT"):
         send_contact_info(user_id)
+    elif payload == "INTENT_SELL":
+        handle_message(user_id, "عايز أبيع شقة", "messenger")
+    elif payload == "INTENT_RENT":
+        handle_message(user_id, "بدور على شقة إيجار", "messenger")
     else:
         handle_message(user_id, payload, "messenger")
 
@@ -608,6 +615,12 @@ def handle_webhook():
                     elif qr_payload == "REGISTER_LEAD":
                         _send_messenger_raw(sender_id,
                             "📝 سجّل طلبك من هنا وهنتواصل معاك:\n👉 https://in-house-bnc.netlify.app\n\nأو ابعتلنا رقمك هنا وهنكلمك 😊")
+                    elif qr_payload == "INTENT_BUY":
+                        handle_message(sender_id, "عايز أشتري شقة", "messenger", msg_id)
+                    elif qr_payload == "INTENT_SELL":
+                        handle_message(sender_id, "عايز أبيع شقة", "messenger", msg_id)
+                    elif qr_payload == "INTENT_RENT":
+                        handle_message(sender_id, "بدور على شقة إيجار", "messenger", msg_id)
                     elif text:
                         handle_message(sender_id, text, "messenger", msg_id)
                 elif "postback" in event:
