@@ -299,8 +299,14 @@ def extract_user_data(user_id, user_message, ai_response):
 
 
 def extract_phone(text):
-    patterns = [r'01[0-9]{9}', r'\+201[0-9]{9}', r'201[0-9]{9}']
     clean = text.replace("-", "").replace(" ", "")
+    patterns = [
+        r'01[0125][0-9]{8}',      # Egyptian local: 01X + 8 digits
+        r'\+201[0125][0-9]{8}',    # International +20
+        r'00201[0125][0-9]{8}',    # International 0020
+        r'\+[1-9][0-9]{9,14}',     # Any international +
+        r'00[1-9][0-9]{9,14}',     # Any international 00
+    ]
     for p in patterns:
         m = re.search(p, clean)
         if m:
