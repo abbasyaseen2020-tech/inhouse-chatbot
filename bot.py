@@ -32,9 +32,9 @@ FB_APP_ID = os.getenv("FB_APP_ID", "")
 FB_APP_SECRET = os.getenv("FB_APP_SECRET", "")
 PAGE_ID = os.getenv("PAGE_ID", "107119435824632")
 
-# Telegram notification (reuse existing lead notification)
+# Telegram notification — multiple admins
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "479117150")
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "479117150,1249685372").split(",")
 
 # ---- AI Provider Auto-Detection ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
@@ -332,8 +332,8 @@ def auto_save_lead(user_id):
 
 
 def notify_telegram_lead(lead):
-    """Send lead notification to Telegram (same as landing page flow)."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+    """Send lead notification to all Telegram admins."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
         return
     text = (
         f"🏠 <b>ليد جديد من الشات بوت</b>\n\n"
@@ -343,14 +343,18 @@ def notify_telegram_lead(lead):
         f"📱 <b>المنصة:</b> {lead.get('platform', 'messenger')}\n"
         f"🕐 <b>الوقت:</b> {lead['timestamp']}"
     )
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text, "parse_mode": "HTML"},
-            timeout=10
-        )
-    except Exception as e:
-        logger.error(f"Telegram notify failed: {e}")
+    for chat_id in TELEGRAM_CHAT_IDS:
+        chat_id = chat_id.strip()
+        if not chat_id:
+            continue
+        try:
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": chat_id, "text": text, "parse_mode": "HTML"},
+                timeout=10
+            )
+        except Exception as e:
+            logger.error(f"Telegram notify failed for {chat_id}: {e}")
 
 
 def fallback_response(message):
