@@ -32,9 +32,9 @@ FB_APP_ID = os.getenv("FB_APP_ID", "")
 FB_APP_SECRET = os.getenv("FB_APP_SECRET", "")
 PAGE_ID = os.getenv("PAGE_ID", "107119435824632")
 
-# Telegram notification — multiple admins
+# Telegram notification — group + admins
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "479117150,1249685372").split(",")
+TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "-5001305547").split(",")
 
 # ---- AI Provider Auto-Detection ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
