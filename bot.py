@@ -36,6 +36,9 @@ PAGE_ID = os.getenv("PAGE_ID", "107119435824632")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_IDS = os.getenv("TELEGRAM_CHAT_IDS", "-5001305547").split(",")
 
+# Google Sheets webhook (Apps Script URL) for persistent lead storage
+SHEETS_WEBHOOK_URL = os.getenv("SHEETS_WEBHOOK_URL", "")
+
 # ---- AI Provider Auto-Detection ----
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
@@ -71,6 +74,46 @@ conversation_history = defaultdict(list)
 user_data = {}
 phone_requested = {}
 MAX_HISTORY = 20
+
+# Track user activity for auto follow-up
+user_last_activity = {}      # user_id -> timestamp of last message
+followup_sent = {}            # user_id -> list of follow-up stages sent
+FOLLOWUP_STAGE_1_HOURS = 24   # 1st follow-up after 24h of silence
+FOLLOWUP_STAGE_2_HOURS = 72   # 2nd follow-up after 72h of silence
+
+# ============================================
+# ANALYTICS — lightweight in-memory counters
+# ============================================
+analytics = {
+    "messages_received": 0,         # total incoming messages
+    "messages_sent": 0,             # total outgoing messages (AI + manual)
+    "comments_received": 0,         # incoming FB comments
+    "comments_replied": 0,          # comments we replied to
+    "leads_captured": 0,            # phone+name pairs captured
+    "appointments_booked": 0,       # confirmed appointments
+    "followups_sent": 0,            # auto follow-ups sent
+    "broadcasts_sent": 0,           # broadcast messages delivered
+    "new_conversations": 0,         # distinct new users started
+    "daily": {},                    # date_str -> {counter_name: int}
+    "started_at": datetime.now().isoformat(),
+}
+
+
+def track(metric, n=1):
+    """Increment analytics counter — daily + lifetime."""
+    try:
+        analytics[metric] = analytics.get(metric, 0) + n
+        today = datetime.now().strftime("%Y-%m-%d")
+        if today not in analytics["daily"]:
+            analytics["daily"][today] = {}
+        analytics["daily"][today][metric] = analytics["daily"][today].get(metric, 0) + n
+        # Keep last 60 days only
+        if len(analytics["daily"]) > 60:
+            old = sorted(analytics["daily"].keys())[:-60]
+            for k in old:
+                analytics["daily"].pop(k, None)
+    except Exception as e:
+        logger.warning(f"Track metric failed: {e}")
 
 # ============================================
 # DUPLICATE MESSAGE PREVENTION
@@ -328,7 +371,29 @@ def auto_save_lead(user_id):
             }
             leads_db.append(lead)
             logger.info(f"Lead saved: {data['name']} - {data['phone']}")
+            track("leads_captured")
             notify_telegram_lead(lead)
+            save_lead_to_sheet(lead)
+
+
+def save_lead_to_sheet(lead):
+    """Persist lead to Google Sheet via Apps Script webhook."""
+    if not SHEETS_WEBHOOK_URL:
+        return
+    payload = {
+        "name": lead.get("name", ""),
+        "phone": lead.get("phone", ""),
+        "source": "ماسنجر",
+        "request_type": lead.get("interest", ""),
+        "area": lead.get("area", ""),
+        "budget": lead.get("budget", ""),
+        "notes": lead.get("notes", ""),
+        "status": "جديد",
+    }
+    try:
+        requests.post(SHEETS_WEBHOOK_URL, json=payload, timeout=10)
+    except Exception as e:
+        logger.error(f"Sheet save failed: {e}")
 
 
 def notify_telegram_lead(lead):
@@ -379,6 +444,13 @@ def handle_message(user_id, message_text, platform="messenger", message_id=None)
         return
     if message_id and is_duplicate_message(message_id):
         return
+    # Record activity for auto follow-up tracking
+    is_new_user = user_id not in user_last_activity
+    user_last_activity[user_id] = time.time()
+    followup_sent.pop(user_id, None)  # reset if user re-engaged
+    track("messages_received")
+    if is_new_user:
+        track("new_conversations")
     logger.info(f"[{platform}] {user_id}: {text[:100]}")
     ai_response = ask_ai(user_id, text, platform)
 
@@ -404,6 +476,7 @@ def handle_message(user_id, message_text, platform="messenger", message_id=None)
         _send_messenger_raw(user_id, ai_response, quick_replies=quick_replies)
     else:
         send_messenger_message(user_id, ai_response)
+    track("messages_sent")
 
 
 # ============================================
@@ -456,6 +529,92 @@ def send_contact_info(user_id):
 
 
 # ============================================
+# APPOINTMENT BOOKING (visit scheduling)
+# ============================================
+appointment_state = {}  # user_id -> {"stage": "...", "slot": "..."}
+
+def start_appointment_booking(user_id):
+    """Start appointment booking flow — show available slots."""
+    from datetime import timedelta
+    slots = []
+    today = datetime.now()
+    for i in range(1, 5):  # next 4 days
+        d = today + timedelta(days=i)
+        day_name = ["الاثنين", "الثلاثاء", "الأربعاء", "الخميس",
+                    "الجمعة", "السبت", "الأحد"][d.weekday()]
+        slots.append({
+            "label": f"{day_name} {d.strftime('%d/%m')} - 11 ص",
+            "payload": f"SLOT_{d.strftime('%Y-%m-%d')}_11",
+        })
+        slots.append({
+            "label": f"{day_name} {d.strftime('%d/%m')} - 5 م",
+            "payload": f"SLOT_{d.strftime('%Y-%m-%d')}_17",
+        })
+
+    appointment_state[user_id] = {"stage": "choosing_slot"}
+    text = "📅 ممكن نحدد معاد المعاينة:\n\nاختر الوقت المناسب 👇"
+    quick_replies = [{"content_type": "text", "title": s["label"], "payload": s["payload"]}
+                     for s in slots[:8]]  # messenger limit ~13
+    _send_messenger_raw(user_id, text, quick_replies=quick_replies)
+
+
+def confirm_appointment(user_id, slot_payload):
+    """Save appointment and notify admins."""
+    # Format: SLOT_YYYY-MM-DD_HH
+    try:
+        _, date_str, hour = slot_payload.split("_")
+        data = user_data.get(user_id, {})
+        name = data.get("name", "عميل")
+        phone = data.get("phone", "—")
+
+        appointment_state[user_id] = {
+            "stage": "confirmed",
+            "slot": f"{date_str} {hour}:00",
+        }
+
+        # Confirm to user
+        text = (
+            f"✅ تم تسجيل معاد المعاينة:\n"
+            f"📅 {date_str} الساعة {hour}:00\n\n"
+            f"فريقنا هيتواصل معاك لتأكيد المكان والتفاصيل 📞"
+        )
+        if not phone or phone == "—":
+            text += "\n\nممكن تبعتلي رقمك عشان نقدر نكلمك؟"
+        _send_messenger_raw(user_id, text)
+
+        # Notify Telegram group
+        summary = (
+            f"📅 <b>حجز معاينة جديد</b>\n\n"
+            f"👤 الاسم: {name}\n"
+            f"📞 الرقم: {phone}\n"
+            f"🗓 المعاد: {date_str} الساعة {hour}:00\n"
+            f"💬 User ID: <code>{user_id}</code>"
+        )
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+            for cid in TELEGRAM_CHAT_IDS:
+                try:
+                    requests.post(
+                        f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                        json={"chat_id": cid.strip(), "text": summary, "parse_mode": "HTML"},
+                        timeout=10,
+                    )
+                except Exception:
+                    pass
+
+        # Save to sheet too
+        save_lead_to_sheet({
+            "name": name, "phone": phone,
+            "interest": f"حجز معاينة {date_str} {hour}:00",
+            "notes": f"معاد محجوز عبر البوت",
+        })
+        track("appointments_booked")
+
+    except Exception as e:
+        logger.error(f"Appointment confirm error: {e}")
+        _send_messenger_raw(user_id, "حصل خطأ صغير، ممكن تبعتلنا واتساب: +20 107 073 6979")
+
+
+# ============================================
 # COMMENT HANDLER
 # ============================================
 def handle_comment(comment_data):
@@ -472,6 +631,7 @@ def handle_comment(comment_data):
         return
     if is_duplicate_comment(comment_id):
         return
+    track("comments_received")
 
     page_id = post_id.split("_")[0] if post_id else ""
     if sender_id == page_id:
@@ -542,6 +702,7 @@ def reply_to_comment(comment_id, text):
             logger.error(f"Comment reply ERROR: {result['error']}")
             return False
         logger.info(f"Comment reply SUCCESS")
+        track("comments_replied")
         return True
     except Exception as e:
         logger.error(f"Comment reply EXCEPTION: {e}")
@@ -625,6 +786,10 @@ def handle_webhook():
                         handle_message(sender_id, "عايز أبيع شقة", "messenger", msg_id)
                     elif qr_payload == "INTENT_RENT":
                         handle_message(sender_id, "بدور على شقة إيجار", "messenger", msg_id)
+                    elif qr_payload.startswith("SLOT_"):
+                        confirm_appointment(sender_id, qr_payload)
+                    elif text and any(kw in text for kw in ["معاينة", "زيارة", "أعاين", "اشوف الشقة", "شوف الشقة"]):
+                        start_appointment_booking(sender_id)
                     elif text:
                         handle_message(sender_id, text, "messenger", msg_id)
                 elif "postback" in event:
@@ -661,6 +826,426 @@ def get_stats():
         "active_conversations": len(conversation_history),
         "users_with_data": len(user_data),
     })
+
+
+# ============================================
+# ANALYTICS ENDPOINTS
+# ============================================
+@app.route("/api/analytics", methods=["GET"])
+def get_analytics():
+    """Return full analytics snapshot — lifetime + daily breakdown."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    today_stats = analytics["daily"].get(today, {})
+
+    # Conversion rate = leads / distinct conversations
+    convs = analytics.get("new_conversations", 0) or 1
+    conv_rate = round((analytics.get("leads_captured", 0) / convs) * 100, 2)
+
+    return jsonify({
+        "lifetime": {
+            "messages_received": analytics.get("messages_received", 0),
+            "messages_sent": analytics.get("messages_sent", 0),
+            "comments_received": analytics.get("comments_received", 0),
+            "comments_replied": analytics.get("comments_replied", 0),
+            "leads_captured": analytics.get("leads_captured", 0),
+            "appointments_booked": analytics.get("appointments_booked", 0),
+            "followups_sent": analytics.get("followups_sent", 0),
+            "broadcasts_sent": analytics.get("broadcasts_sent", 0),
+            "new_conversations": analytics.get("new_conversations", 0),
+            "conversion_rate_pct": conv_rate,
+        },
+        "today": today_stats,
+        "daily": analytics["daily"],
+        "started_at": analytics.get("started_at"),
+    })
+
+
+def build_weekly_report():
+    """Build a 7-day aggregated report string (HTML for Telegram)."""
+    from datetime import timedelta
+    today = datetime.now()
+    last_7_days = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(7)]
+
+    agg = {
+        "messages_received": 0,
+        "messages_sent": 0,
+        "comments_received": 0,
+        "comments_replied": 0,
+        "leads_captured": 0,
+        "appointments_booked": 0,
+        "followups_sent": 0,
+        "new_conversations": 0,
+    }
+    for d in last_7_days:
+        day = analytics["daily"].get(d, {})
+        for k in agg:
+            agg[k] += day.get(k, 0)
+
+    # Pull sheet stats if available (authoritative lead count from the sheet)
+    sheet_totals = {}
+    if SHEETS_WEBHOOK_URL:
+        try:
+            r = requests.get(f"{SHEETS_WEBHOOK_URL}?action=stats", timeout=15)
+            if r.ok:
+                s = r.json()
+                if s.get("totals"):
+                    sheet_totals = s["totals"]
+        except Exception as e:
+            logger.warning(f"Weekly report — sheet stats fetch failed: {e}")
+
+    convs = agg["new_conversations"] or 1
+    conv_rate = round((agg["leads_captured"] / convs) * 100, 1)
+
+    from_date = last_7_days[-1]
+    to_date = last_7_days[0]
+
+    lines = [
+        "📊 <b>التقرير الأسبوعي — إن هاوس</b>",
+        f"📅 من {from_date} إلى {to_date}",
+        "",
+        "<b>📨 الرسائل:</b>",
+        f"• رسائل واردة: {agg['messages_received']}",
+        f"• ردود مرسلة: {agg['messages_sent']}",
+        "",
+        "<b>💬 التعليقات:</b>",
+        f"• تعليقات واردة: {agg['comments_received']}",
+        f"• ردود تعليقات: {agg['comments_replied']}",
+        "",
+        "<b>🎯 النتائج:</b>",
+        f"• محادثات جديدة: {agg['new_conversations']}",
+        f"• ليدز محفوظة (من البوت): {agg['leads_captured']}",
+        f"• حجوزات معاينة: {agg['appointments_booked']}",
+        f"• رسائل متابعة: {agg['followups_sent']}",
+        f"• نسبة التحويل: {conv_rate}%",
+    ]
+
+    if sheet_totals:
+        lines.extend([
+            "",
+            "<b>📋 من الشيت (كل المصادر):</b>",
+            f"• إجمالي الليدز: {sheet_totals.get('all', 0)}",
+            f"• آخر أسبوع: {sheet_totals.get('this_week', 0)}",
+            f"• آخر شهر: {sheet_totals.get('this_month', 0)}",
+        ])
+
+    lines.extend([
+        "",
+        "📈 الداشبورد: <a href=\"https://in-house-bnc.netlify.app/dashboard.html\">فتح</a>",
+    ])
+
+    return "\n".join(lines)
+
+
+@app.route("/api/report/weekly", methods=["POST", "GET"])
+def weekly_report():
+    """Send weekly summary to Telegram group. Call via cron every Sunday 9am."""
+    try:
+        report = build_weekly_report()
+
+        if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_IDS:
+            return jsonify({"success": False, "error": "Telegram not configured", "preview": report})
+
+        sent_to = []
+        for cid in TELEGRAM_CHAT_IDS:
+            cid = cid.strip()
+            if not cid:
+                continue
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={
+                        "chat_id": cid,
+                        "text": report,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True,
+                    },
+                    timeout=10,
+                )
+                if r.ok:
+                    sent_to.append(cid)
+            except Exception as e:
+                logger.error(f"Weekly report send failed for {cid}: {e}")
+
+        return jsonify({
+            "success": len(sent_to) > 0,
+            "sent_to": sent_to,
+            "preview": report,
+        })
+    except Exception as e:
+        logger.error(f"Weekly report error: {e}")
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+@app.route("/api/report/daily", methods=["POST", "GET"])
+def daily_report():
+    """Send a short daily summary to Telegram (call at 9pm daily)."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        d = analytics["daily"].get(today, {})
+
+        if not any(d.values()):
+            # Nothing happened today — skip
+            return jsonify({"success": True, "skipped": "no activity today"})
+
+        lines = [
+            f"🌙 <b>ملخص اليوم — {today}</b>",
+            "",
+            f"💬 رسائل: {d.get('messages_received', 0)} واردة / {d.get('messages_sent', 0)} ردود",
+            f"👥 محادثات جديدة: {d.get('new_conversations', 0)}",
+            f"📝 ليدز محفوظة: {d.get('leads_captured', 0)}",
+            f"📅 حجوزات معاينة: {d.get('appointments_booked', 0)}",
+            f"💬 تعليقات: {d.get('comments_received', 0)} ← رد على {d.get('comments_replied', 0)}",
+        ]
+        text = "\n".join(lines)
+
+        if not TELEGRAM_BOT_TOKEN:
+            return jsonify({"success": False, "preview": text})
+
+        sent = 0
+        for cid in TELEGRAM_CHAT_IDS:
+            cid = cid.strip()
+            if not cid:
+                continue
+            try:
+                r = requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": cid, "text": text, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+                if r.ok:
+                    sent += 1
+            except Exception:
+                pass
+
+        return jsonify({"success": sent > 0, "sent_to_chats": sent, "preview": text})
+    except Exception as e:
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ============================================
+# BROADCAST — re-engagement message
+# ============================================
+BROADCAST_MESSAGE = """كل سنة وحضرتك بخير 🌟
+
+فريق إن هاوس في بني سويف — لسه بنتابع تواصلنا معاك عشان نوفرلك أحسن العروض العقارية.
+
+بتدور على إيه؟
+🏠 شراء
+💰 بيع
+📈 استثمار
+
+سجّل طلبك في ثواني:
+👉 https://in-house-bnc.netlify.app
+
+أو واتساب مباشر: +20 107 073 6979"""
+
+
+def fetch_recent_conversations(limit=500):
+    """Fetch conversations from the Page's inbox (last messaged users)."""
+    if not PAGE_ACCESS_TOKEN:
+        return []
+    conversations = []
+    url = f"{GRAPH_API_URL}/me/conversations"
+    params = {
+        "access_token": PAGE_ACCESS_TOKEN,
+        "fields": "participants,updated_time",
+        "limit": 100,
+    }
+    try:
+        while url and len(conversations) < limit:
+            r = requests.get(url, params=params, timeout=15)
+            data = r.json()
+            if "error" in data:
+                logger.error(f"Conversations fetch error: {data['error']}")
+                break
+            for conv in data.get("data", []):
+                for p in conv.get("participants", {}).get("data", []):
+                    if p.get("id") and p["id"] != PAGE_ID:
+                        conversations.append({
+                            "user_id": p["id"],
+                            "name": p.get("name", ""),
+                            "updated_time": conv.get("updated_time", ""),
+                        })
+            paging = data.get("paging", {})
+            url = paging.get("next")
+            params = None
+    except Exception as e:
+        logger.error(f"Fetch conversations failed: {e}")
+    return conversations
+
+
+@app.route("/api/broadcast/preview", methods=["GET"])
+def broadcast_preview():
+    """Preview who will receive the broadcast (dry-run — no messages sent)."""
+    convs = fetch_recent_conversations()
+    return jsonify({
+        "total_conversations": len(convs),
+        "message": BROADCAST_MESSAGE,
+        "sample_users": convs[:10],
+        "note": "call POST /api/broadcast/send?confirm=YES to actually send",
+    })
+
+
+# ============================================
+# AUTO FOLLOW-UP — silent conversation recovery
+# ============================================
+FOLLOWUP_STAGE_1 = """أهلاً 👋
+
+فاكرنا؟ إحنا فريق إن هاوس — لسه بتدور على شقة في بني سويف؟
+
+لو نفسك نساعدك، احكيلنا وهنرجعلك بأحسن عرض 🏠"""
+
+FOLLOWUP_STAGE_2 = """مرحباً تاني 🌟
+
+لو لسه مهتم بشقة (شراء/بيع/إيجار) في بني سويف:
+👉 https://in-house-bnc.netlify.app
+
+أو واتساب: +20 107 073 6979
+
+في خدمتك أي وقت 🙏"""
+
+
+@app.route("/api/followup/run", methods=["POST", "GET"])
+def followup_run():
+    """Check for silent conversations and send follow-up messages.
+    Call this endpoint every 1-6 hours via external cron (cron-job.org, UptimeRobot, etc.)
+    """
+    now = time.time()
+    stage1_sent = 0
+    stage2_sent = 0
+    errors = []
+
+    for user_id, last_ts in list(user_last_activity.items()):
+        hours_silent = (now - last_ts) / 3600
+        sent_stages = followup_sent.get(user_id, [])
+
+        # Skip if user already has phone — they're a lead, not abandoned
+        if user_data.get(user_id, {}).get("phone"):
+            continue
+
+        text = None
+        stage = None
+
+        if hours_silent >= FOLLOWUP_STAGE_2_HOURS and 2 not in sent_stages:
+            text = FOLLOWUP_STAGE_2
+            stage = 2
+        elif hours_silent >= FOLLOWUP_STAGE_1_HOURS and 1 not in sent_stages:
+            text = FOLLOWUP_STAGE_1
+            stage = 1
+
+        if not text:
+            continue
+
+        try:
+            # Use HUMAN_AGENT tag to allow sending outside 24h window
+            payload = {
+                "recipient": {"id": user_id},
+                "message": {"text": text},
+                "messaging_type": "MESSAGE_TAG",
+                "tag": "HUMAN_AGENT",
+            }
+            r = requests.post(
+                f"{GRAPH_API_URL}/me/messages",
+                json=payload,
+                params={"access_token": PAGE_ACCESS_TOKEN},
+                timeout=10,
+            )
+            if r.ok:
+                sent_stages.append(stage)
+                followup_sent[user_id] = sent_stages
+                track("followups_sent")
+                if stage == 1: stage1_sent += 1
+                else: stage2_sent += 1
+            else:
+                err = r.json().get("error", {}).get("message", "unknown")[:100]
+                if len(errors) < 5:
+                    errors.append({"user": user_id, "stage": stage, "error": err})
+            time.sleep(0.2)
+        except Exception as e:
+            if len(errors) < 5:
+                errors.append({"user": user_id, "stage": stage, "error": str(e)[:100]})
+
+    return jsonify({
+        "stage1_sent": stage1_sent,
+        "stage2_sent": stage2_sent,
+        "total_tracked": len(user_last_activity),
+        "errors_sample": errors,
+    })
+
+
+@app.route("/api/broadcast/send", methods=["POST", "GET"])
+def broadcast_send():
+    """Send broadcast message to eligible users (24-hour window)."""
+    if request.args.get("confirm") != "YES":
+        return jsonify({
+            "error": "Missing confirmation",
+            "usage": "POST /api/broadcast/send?confirm=YES",
+        }), 400
+
+    convs = fetch_recent_conversations()
+    sent = 0
+    failed = 0
+    errors_sample = []
+
+    for conv in convs:
+        user_id = conv["user_id"]
+        try:
+            # messaging_type=MESSAGE_TAG with HUMAN_AGENT allows 7-day window
+            payload = {
+                "recipient": {"id": user_id},
+                "message": {"text": BROADCAST_MESSAGE},
+                "messaging_type": "MESSAGE_TAG",
+                "tag": "HUMAN_AGENT",
+            }
+            r = requests.post(
+                f"{GRAPH_API_URL}/me/messages",
+                json=payload,
+                params={"access_token": PAGE_ACCESS_TOKEN},
+                timeout=10,
+            )
+            if r.ok:
+                sent += 1
+                track("broadcasts_sent")
+            else:
+                failed += 1
+                if len(errors_sample) < 5:
+                    errors_sample.append({
+                        "user": conv.get("name", user_id),
+                        "error": r.json().get("error", {}).get("message", "unknown")[:120],
+                    })
+            time.sleep(0.2)  # rate limit safety
+        except Exception as e:
+            failed += 1
+            if len(errors_sample) < 5:
+                errors_sample.append({"user": user_id, "error": str(e)[:120]})
+
+    result = {
+        "total": len(convs),
+        "sent": sent,
+        "failed": failed,
+        "errors_sample": errors_sample,
+    }
+    logger.info(f"Broadcast done: {result}")
+
+    # Notify Telegram group with the result
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_IDS:
+        summary = (
+            f"📣 <b>تم إرسال رسالة إعادة التفعيل</b>\n\n"
+            f"📊 المحادثات الكلية: {len(convs)}\n"
+            f"✅ اتبعتت بنجاح: {sent}\n"
+            f"❌ فشلت: {failed}"
+        )
+        for cid in TELEGRAM_CHAT_IDS:
+            try:
+                requests.post(
+                    f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                    json={"chat_id": cid.strip(), "text": summary, "parse_mode": "HTML"},
+                    timeout=10,
+                )
+            except Exception:
+                pass
+
+    return jsonify(result)
 
 
 @app.route("/api/debug-permissions", methods=["GET"])
