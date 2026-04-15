@@ -721,6 +721,73 @@ def send_private_reply(comment_id, text):
         logger.error(f"Private reply FAILED: {e}")
 
 
+# ============================================
+# VOICE / AUDIO MESSAGE HANDLING (Whisper)
+# ============================================
+OPENAI_WHISPER_URL = "https://api.openai.com/v1/audio/transcriptions"
+
+
+def transcribe_audio_url(audio_url, language="ar"):
+    """Download an audio file and transcribe via OpenAI Whisper.
+    Returns the transcribed text or None on failure.
+    """
+    if not OPENAI_API_KEY:
+        logger.warning("Whisper: no OPENAI_API_KEY set")
+        return None
+    try:
+        # 1. Download the audio from Messenger CDN
+        audio_resp = requests.get(audio_url, timeout=20)
+        audio_resp.raise_for_status()
+        audio_bytes = audio_resp.content
+        if len(audio_bytes) > 25 * 1024 * 1024:  # Whisper 25 MB limit
+            logger.warning("Whisper: audio too large")
+            return None
+
+        # 2. Send to Whisper API
+        files = {
+            "file": ("voice.ogg", audio_bytes, "audio/ogg"),
+            "model": (None, "whisper-1"),
+            "language": (None, language),
+        }
+        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
+        w = requests.post(OPENAI_WHISPER_URL, headers=headers, files=files, timeout=60)
+        w.raise_for_status()
+        text = w.json().get("text", "").strip()
+        logger.info(f"Whisper transcribed {len(audio_bytes)} bytes → '{text[:80]}'")
+        return text or None
+    except Exception as e:
+        logger.error(f"Whisper transcribe failed: {e}")
+        return None
+
+
+def handle_voice_message(user_id, audio_url, message_id=None):
+    """Handle a voice message: transcribe + hand to normal flow."""
+    if message_id and is_duplicate_message(message_id):
+        return
+
+    # Send typing indicator
+    try:
+        requests.post(
+            f"{GRAPH_API_URL}/me/messages",
+            json={"recipient": {"id": user_id}, "sender_action": "typing_on"},
+            params={"access_token": PAGE_ACCESS_TOKEN},
+            timeout=5,
+        )
+    except Exception:
+        pass
+
+    transcript = transcribe_audio_url(audio_url)
+    if not transcript:
+        _send_messenger_raw(user_id,
+            "ما قدرتش أسمع الرسالة الصوتية دي 😅\n"
+            "ممكن تكتبلي اللي محتاجه؟ أو ابعتنا على واتساب: +20 107 073 6979")
+        return
+
+    # Acknowledge we heard them, then process via normal flow
+    _send_messenger_raw(user_id, f"📝 فهمت من صوتك: \"{transcript[:200]}\"")
+    handle_message(user_id, transcript, "messenger", None)
+
+
 def split_message(text, max_length):
     chunks = []
     while len(text) > max_length:
@@ -773,6 +840,17 @@ def handle_webhook():
                     msg_id = message.get("mid")
                     qr_payload = message.get("quick_reply", {}).get("payload", "")
                     text = message.get("text", "")
+
+                    # Voice / audio attachments — transcribe via Whisper
+                    audio_url = None
+                    for att in message.get("attachments", []) or []:
+                        if att.get("type") == "audio":
+                            audio_url = att.get("payload", {}).get("url")
+                            if audio_url:
+                                break
+                    if audio_url:
+                        handle_voice_message(sender_id, audio_url, msg_id)
+                        continue
 
                     # Handle special quick reply payloads
                     if qr_payload in ("ICE_CONTACT", "MENU_CONTACT"):
